@@ -7,6 +7,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core import (
@@ -16,6 +17,7 @@ from app.core import (
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
+    locate_cumulative_target,
     reconcile_master_sub_loss,
     reconcile_meter_total,
     reconcile_total,
@@ -60,6 +62,10 @@ def _dual_meter(payload):
 
 def _outage(payload):
     return _post(payload, path="/v1/usage/outage-reconcile")
+
+
+def _target_locate(payload):
+    return _post(payload, path="/v1/usage/target-locate")
 
 
 # ---------------------------------------------------------------------------
@@ -3674,3 +3680,331 @@ def test_reconcile_master_sub_loss_exact_by_brute_force():
             for i in range(n_seg):
                 assert lows[i] + sum(highs[j] for j in range(n_seg) if j != i) == L
     assert checked > 300
+
+
+# ---------------------------------------------------------------------------
+# 账期累计用量目标定位 /v1/usage/target-locate
+# ---------------------------------------------------------------------------
+
+_TARGET_READINGS = [
+    {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+    {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+    {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+]
+
+
+def test_target_locate_non_unique_segment():
+    """账单 5000（K=5）、目标 2500：最早段 0、最晚段 1，段位不唯一。"""
+    resp = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5000,
+            "target_usage": 2500,
+            "readings": _TARGET_READINGS,
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 5
+    assert body["segment_unique"] is False
+    assert body["earliest_segment"]["segment_index"] == 0
+    assert body["latest_segment"]["segment_index"] == 1
+    # 边界累计用量范围与 /v1/usage/reconcile 的分段范围一致且联立可达
+    bounds = [(b["min_usage"], b["max_usage"]) for b in body["boundaries"]]
+    assert bounds == [(0, 0), (100, 4100), (5000, 5000)]
+    wraps = [
+        (b["min_cumulative_wraps"], b["max_cumulative_wraps"])
+        for b in body["boundaries"]
+    ]
+    assert wraps == [(0, 0), (0, 4), (5, 5)]
+    # 首末边界恒为 0 与账单总量
+    assert body["boundaries"][0]["reading"] == 100
+    assert body["boundaries"][-1]["min_usage"] == 5000
+    # 分段范围与账单对账接口相同
+    assert [s["min_usage"] for s in body["segments"]] == [100, 900]
+    assert body["conflicts"] == []
+    assert "同时联立" in body["boundary_note"]
+
+
+def test_target_locate_unique_segment():
+    """目标只能在最后一段达到：前一段累计上界 < 目标 <= 账单总量。
+
+    两段（M=1000，各 1000s、速率 5），账单 2000（K=2）：
+    段0 圈数 [0,1]（用量 [100,1100]）、段1 圈数 [1,2]（用量 [900,1900]），
+    目标 1500 时边界1 累计至多 1100 < 1500，最早与最晚段均为 1。
+    """
+    resp = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 5,
+            "total_usage": 2000,
+            "target_usage": 1500,
+            "readings": _TARGET_READINGS,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["segment_unique"] is True
+    assert body["earliest_segment"]["segment_index"] == 1
+    assert body["latest_segment"]["segment_index"] == 1
+    bounds = [(b["min_usage"], b["max_usage"]) for b in body["boundaries"]]
+    assert bounds == [(0, 0), (100, 1100), (2000, 2000)]
+
+
+def test_target_locate_single_segment():
+    """只有一段时，任何 1 <= T <= B 都唯一落在段 0，不推断段内时间。"""
+    resp = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 3100,
+            "target_usage": 1,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["segment_unique"] is True
+    assert body["earliest_segment"]["segment_index"] == 0
+    assert body["latest_segment"]["segment_index"] == 0
+    # 目标取账单总量时仍落在最后（也是唯一一）段
+    resp2 = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 3100,
+            "target_usage": 3100,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+            ],
+        }
+    )
+    b2 = resp2.json()
+    assert b2["segment_unique"] is True
+    assert b2["latest_segment"]["segment_index"] == 0
+
+
+def test_target_locate_target_equal_to_boundary_value():
+    """目标恰可取某边界确定值时，达到段为该边界前一段（C_p 含端点）。"""
+    # 账单 1000（K=1）：段0 用量 100（唯一）、段1 用量 900（唯一）。
+    # 目标 100 恰在边界1 达到 -> 段 0；目标 101 -> 段 1。
+    for target, expected in ((100, 0), (101, 1), (1000, 1), (1, 0)):
+        resp = _target_locate(
+            {
+                "modulus": 1000,
+                "max_rate_per_second": 10,
+                "total_usage": 1000,
+                "target_usage": target,
+                "readings": _TARGET_READINGS,
+            }
+        )
+        body = resp.json()
+        assert body["segment_unique"] is True
+        assert body["earliest_segment"]["segment_index"] == expected
+        assert body["latest_segment"]["segment_index"] == expected
+
+
+def test_target_locate_segment_no_solution_conflict():
+    """单段无解：分段冲突，不做总量推断，boundaries 为空。"""
+    resp = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 0.01,
+            "total_usage": 100,
+            "target_usage": 50,
+            "readings": _TARGET_READINGS,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["total_wraps"] is None
+    assert body["boundaries"] == []
+    assert body["segments"] == []
+    assert body["earliest_segment"] is None and body["latest_segment"] is None
+    assert body["segment_unique"] is False
+    kinds = [(c["kind"], c["reason"]) for c in body["conflicts"]]
+    assert kinds == [("segment", "no_solution"), ("segment", "no_solution")]
+
+
+def test_target_locate_incompatible_modulus_conflict():
+    """账单与模数不同余：与 reconcile 同一冲突原因。"""
+    resp = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5500,
+            "target_usage": 100,
+            "readings": _TARGET_READINGS,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    c = body["conflicts"][0]
+    assert c["kind"] == "total"
+    assert c["reason"] == "total_incompatible_modulus"
+    assert c["expected_remainder"] == 0
+    assert c["total_wraps"] is None
+    assert body["boundaries"] == []
+
+
+def test_target_locate_out_of_range_conflict():
+    """同余但总量超出可行区间：total_out_of_range，K 仍给出。"""
+    # 速率 5：两段圈数区间 [0,4] 与 [1,5]，K 可行和为 [1, 9]，
+    # 即可行账单 [1000, 9000]；账单 20000 隐含 K=20 超出。
+    resp = _target_locate(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 5,
+            "total_usage": 20000,
+            "target_usage": 100,
+            "readings": _TARGET_READINGS,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    c = body["conflicts"][0]
+    assert c["reason"] == "total_out_of_range"
+    assert c["feasible_min_total"] == 1000
+    assert c["feasible_max_total"] == 9000
+    assert c["total_wraps"] == 20
+
+
+def test_target_locate_target_validation():
+    """目标 < 1 或 > 账单总量均为 422。"""
+    payload = {
+        "modulus": 1000,
+        "max_rate_per_second": 10,
+        "total_usage": 1000,
+        "readings": _TARGET_READINGS,
+    }
+    r1 = _target_locate({**payload, "target_usage": 0})
+    assert r1.status_code == 422
+    r2 = _target_locate({**payload, "target_usage": 1001})
+    assert r2.status_code == 422
+    assert "目标用量必须不超过账单总用量" in r2.json()["detail"][0]["msg"]
+
+
+def test_target_locate_reuses_reading_validation():
+    """读数/模数/速率校验与其他接口一致。"""
+    base = {
+        "modulus": 1000,
+        "max_rate_per_second": 10,
+        "total_usage": 1000,
+        "target_usage": 500,
+        "readings": _TARGET_READINGS,
+    }
+    # 读数越界
+    bad = copy.deepcopy(base)
+    bad["readings"][1]["value"] = 1000
+    assert _target_locate(bad).status_code == 422
+    # 时间不递增
+    bad = copy.deepcopy(base)
+    bad["readings"][1]["timestamp"] = "2026-09-24T00:33:20Z"
+    assert _target_locate(bad).status_code == 422
+    # 负速率
+    bad = copy.deepcopy(base)
+    bad["max_rate_per_second"] = -1
+    assert _target_locate(bad).status_code == 422
+    # 缺时区
+    bad = copy.deepcopy(base)
+    bad["readings"][0]["timestamp"] = "2026-09-24T00:00:00"
+    assert _target_locate(bad).status_code == 422
+
+
+def test_locate_cumulative_target_core_boundaries_simple():
+    """核心函数：边界累计范围与收紧后段范围一致（前缀联立公式）。"""
+    res = locate_cumulative_target(
+        diffs=[100, -100],
+        wrap_bounds=[(0, 9), (1, 9)],
+        total_usage=5000,
+        modulus=1000,
+        target_usage=2500,
+    )
+    assert res.status == "ok"
+    assert res.total_wraps == 5
+    assert (res.earliest_segment, res.latest_segment) == (0, 1)
+    assert res.segment_unique is False
+    assert [(b.min_usage, b.max_usage) for b in res.boundaries] == [
+        (0, 0),
+        (100, 4100),
+        (5000, 5000),
+    ]
+
+
+def test_locate_cumulative_target_invalid_target():
+    """核心函数对目标越界抛 ValueError（由请求模型在 API 层拦截）。"""
+    with pytest.raises(ValueError):
+        locate_cumulative_target([0], [(0, 1)], 10, 10, 0)
+    with pytest.raises(ValueError):
+        locate_cumulative_target([0], [(0, 1)], 10, 10, 11)
+
+
+def test_locate_cumulative_target_exact_by_brute_force():
+    """随机小参数下，边界范围、最早/最晚段与枚举全部圈数组合一致。
+
+    特别校验前缀范围是与剩余各段圈数区间同时联立的结果，而不是把
+    互不兼容的分段独立极值拼接。
+    """
+    rng = random.Random(20260926)
+    checked = 0
+    for _ in range(4000):
+        n = rng.randint(1, 4)
+        modulus = rng.choice([1, 2, 3, 5, 7, 11])
+        diffs = [rng.randint(-modulus + 1, modulus - 1) for _ in range(n)]
+        if modulus == 1:
+            diffs = [0] * n  # M=1 时读数恒为 0，diff 恒为 0
+        bounds = []
+        for d in diffs:
+            k_min = 0 if d >= 0 else (-d + modulus - 1) // modulus
+            k_max = k_min + rng.randint(0, 4)
+            bounds.append((k_min, k_max))
+        lows = [lo for lo, _ in bounds]
+        highs = [hi for _, hi in bounds]
+        total_wraps = rng.randint(sum(lows), sum(highs))
+        total_usage = sum(diffs) + modulus * total_wraps
+        if total_usage < 1:
+            continue
+
+        ranges = [range(lo, hi + 1) for lo, hi in bounds]
+        allocations = [ks for ks in itertools.product(*ranges) if sum(ks) == total_wraps]
+        assert allocations  # Σlo <= K <= Σhi 保证至少一个可行组合
+
+        for target in {1, total_usage, rng.randint(1, total_usage)}:
+            res = locate_cumulative_target(
+                diffs, bounds, total_usage, modulus, target
+            )
+            assert res.status == "ok"
+            # 每个边界：枚举所有满足 Σk=K 的完整分配，累计用量最小/最大
+            for p in range(n + 1):
+                vals = [
+                    sum(diffs[j] + ks[j] * modulus for j in range(p))
+                    for ks in allocations
+                ]
+                b = res.boundaries[p]
+                assert (b.min_usage, b.max_usage) == (min(vals), max(vals)), (
+                    diffs, bounds, total_wraps, target, p,
+                    (b.min_usage, b.max_usage), (min(vals), max(vals)),
+                )
+            # 最早/最晚 crossing 段：对每个完整可行分配定位
+            crossed = []
+            for ks in allocations:
+                cum = 0
+                for i in range(n):
+                    usage_i = diffs[i] + ks[i] * modulus
+                    if cum < target <= cum + usage_i:
+                        crossed.append(i)
+                        break
+                    cum += usage_i
+                else:
+                    raise AssertionError("目标必然在某段达到")
+            assert res.earliest_segment == min(crossed)
+            assert res.latest_segment == max(crossed)
+            assert res.segment_unique == (min(crossed) == max(crossed))
+            checked += 1
+    assert checked > 500

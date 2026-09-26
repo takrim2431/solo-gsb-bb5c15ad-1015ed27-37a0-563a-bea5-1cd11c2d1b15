@@ -146,6 +146,24 @@
     （total_out_of_range）。收紧后 lo_i == hi_i 的段漏损唯一、给出
     确定值，其余段只给漏损上下界（端点均可达到，交叉端点相等），不
     枚举任何回绕组合。
+
+账期累计用量目标定位（locate_cumulative_target）：
+    先完全复用 reconcile_total：单段无解由调用方先行判定，账单同余冲突、
+    总量超界原因与总量对账一致。可行时总回绕次数 K 固定，第 i 段用量
+    u_i = diff_i + k_i·M >= 0，k_i ∈ [kmin_i, kmax_i]，Σ k_i = K。
+    读数边界 p（0 <= p <= n）的累计用量为
+        C_p = Σ_{j<p} u_j = D_p + M·W_p，W_p = Σ_{j<p} k_j
+    （D_p = Σ_{j<p} diff_j = r_p − r_0，望远镜相消）。W_p 的可行闭区间
+    必须与剩余各段（后缀 p..n-1）的圈数区间同时联立：
+        W_p_min = max(Σ_{j<p} kmin_j, K − Σ_{j>=p} kmax_j)
+        W_p_max = min(Σ_{j<p} kmax_j, K − Σ_{j>=p} kmin_j)
+    四个界分别对应前缀取最小/最大与后缀取最大/最小，端点均可由某个完整
+    可行分配达到——不能只把各段独立极值直接拼接（前缀取下界时后缀未必还
+    能凑出 K − W_p）。各段用量非负故 C_p 随 p 单调不减；目标 T
+    （1 <= T <= B）首次达到或超过 T 的段 i 满足 C_i < T <= C_{i+1}。
+    最早段为 min{i: C_{i+1}_max >= T}，最晚段为 max{i: C_i_min < T}，
+    二者相同才表示无论何种可行分配 crossing 都发生在同一段；接口只定位到
+    相邻读数段，不推断段内具体时间。
 """
 
 from __future__ import annotations
@@ -1783,4 +1801,173 @@ def reconcile_master_sub_loss(
         total_wraps=total_wraps,
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 账期累计用量目标定位（target-locate）：固定整期总圈数，定位目标用量最早/最晚
+# 发生在哪一对相邻读数之间
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CumulativeBoundary:
+    """一个读数边界上的累计用量可行闭区间（前缀各段与后缀各段联立后）。"""
+
+    index: int  # 读数边界索引，0 = 首读数，n = 末读数
+    cumulative_diff: int  # D_p = 前 p 段读数差之和（望远镜相消为 r_p − r_0）
+    min_wraps: int  # 前 p 段圈数之和 W_p 的可行下界
+    max_wraps: int  # W_p 的可行上界
+    min_usage: int  # 边界累计用量下界 C_p_min = D_p + M·W_p_min
+    max_usage: int  # 边界累计用量上界 C_p_max = D_p + M·W_p_max
+
+
+@dataclass(frozen=True)
+class TargetLocateResult:
+    """账期累计用量目标定位结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_* 原因
+    total_wraps: Optional[int]  # 账单隐含的总回绕次数 K；不相容时为 None
+    target_usage: int
+    narrowed: Tuple[NarrowedSegment, ...]
+    boundaries: Tuple[CumulativeBoundary, ...]
+    # 累计用量首次达到/超过目标可能发生的最早段索引；冲突时为 None
+    earliest_segment: Optional[int]
+    # 可能发生的最晚段索引；冲突时为 None
+    latest_segment: Optional[int]
+
+    @property
+    def segment_unique(self) -> bool:
+        """最早段与最晚段相同：目标达到的相邻读数段被唯一确定。"""
+        return (
+            self.earliest_segment is not None
+            and self.earliest_segment == self.latest_segment
+        )
+
+
+def locate_cumulative_target(
+    diffs: Sequence[int],
+    wrap_bounds: Sequence[Tuple[int, int]],
+    total_usage: int,
+    modulus: int,
+    target_usage: int,
+) -> TargetLocateResult:
+    """固定整期总圈数下定位累计用量首次达到目标的最早/最晚相邻读数段。
+
+    调用方需先逐段复用 :func:`solve_segment` 判定非负增量与速率上限
+    （调用方需保证每段均可行，``k_max >= k_min``）。本函数先完全复用
+    :func:`reconcile_total`：账单总量与首尾读数差模 ``modulus`` 不同余为
+    ``total_incompatible_modulus``，总回绕次数超出各段圈数区间和为
+    ``total_out_of_range``；``target_usage`` 还须满足
+    ``1 <= target_usage <= total_usage``（由请求模型校验）。
+
+    可行时总回绕次数 ``K = Σ k_i`` 固定。第 ``i`` 段用量
+    ``u_i = diff_i + k_i·modulus``（非负整数），读数边界 ``p``
+    （``0 <= p <= n``，``n`` 为段数）的累计用量
+
+        C_p = Σ_{j<p} u_j = D_p + M·W_p，W_p = Σ_{j<p} k_j
+
+    其中 ``D_p = Σ_{j<p} diff_j``（望远镜相消即 ``r_p − r_0``）。
+    ``W_p`` 的可行闭区间必须与**剩余各段**（后缀 ``p..n-1``，其圈数和为
+    ``K − W_p``）的圈数区间同时联立，不能只把前缀各段独立极值拼接：
+
+        W_p_min = max(Σ_{j<p} kmin_j, K − Σ_{j>=p} kmax_j)
+        W_p_max = min(Σ_{j<p} kmax_j, K − Σ_{j>=p} kmin_j)
+
+    下界在「前缀各段取 kmin、后缀各段取 kmax」的完整分配处达到，上界
+    在「前缀取 kmax、后缀取 kmin」处达到（各段独立取连续整数区间，任意
+    中间值均可达到），故四个界联合给出的恰是 ``W_p`` 的全部可行值，
+    ``C_p`` 的可行闭区间为 ``[D_p + M·W_p_min, D_p + M·W_p_max]``。
+
+    各段用量非负，故 ``C_p`` 关于 ``p`` 单调不减。目标 ``T`` 首次达到或
+    超过 T 的段 ``i`` 满足 ``C_i < T <= C_{i+1}``：
+
+    - 最早可能段：``min{i : C_{i+1}_max >= T}``（存在某个完整分配使
+      累计到边界 ``i+1`` 已达目标；后缀同时取其最大值，联立保证可达到）；
+    - 最晚可能段：``max{i : C_i_min < T}``（存在某个完整分配使累计到
+      边界 ``i`` 仍未达目标；后缀同时取其最小值，联立保证可达到）。
+
+    ``earliest == latest`` 时目标在哪一对相邻读数之间被达到是唯一的；
+    否则目标段随可行圈数分配而不同，只给范围，**不推断段内具体时间**。
+
+    :param diffs: 各段首尾读数差 r2 - r1
+    :param wrap_bounds: 各段在非负增量与速率上限下的可行圈数区间
+        ``(k_min, k_max)``，调用方需保证每段均可行
+    :param total_usage: 账单总用量（非负整数）
+    :param modulus: 计数器模数
+    :param target_usage: 目标累计用量，满足 1 <= target_usage <= total_usage
+    """
+    if not (1 <= target_usage <= total_usage):
+        raise ValueError("target_usage 必须满足 1 <= target_usage <= total_usage")
+
+    # 1) 完全复用账单总量对账：同余冲突 / 总量超界原因与既有接口一致
+    reconciled = reconcile_total(diffs, wrap_bounds, total_usage, modulus)
+    if reconciled.status == STATUS_CONFLICT:
+        return TargetLocateResult(
+            status=STATUS_CONFLICT,
+            conflicts=reconciled.conflicts,
+            total_wraps=reconciled.total_wraps,
+            target_usage=target_usage,
+            narrowed=(),
+            boundaries=(),
+            earliest_segment=None,
+            latest_segment=None,
+        )
+
+    K = reconciled.total_wraps
+    assert K is not None  # STATUS_OK 时总回绕次数必为整数
+    n = len(diffs)
+    lows = [lo for lo, _ in wrap_bounds]
+    highs = [hi for _, hi in wrap_bounds]
+    total_high = sum(highs)
+    total_low = sum(lows)
+
+    # 2) 各读数边界的累计用量可行闭区间：前缀圈数和与后缀圈数区间同时联立。
+    #    前缀和按原始（联立前）区间累加即可——Σ kmin 与 Σ kmax 的分配与
+    #    后缀极值同时可行（独立段），恰等于收紧后的前缀和范围。
+    boundaries: list = []
+    prefix_low = 0
+    prefix_high = 0
+    prefix_diff = 0
+    for p in range(n + 1):
+        # 后缀 p..n-1 的圈数区间和
+        suffix_low = total_low - prefix_low
+        suffix_high = total_high - prefix_high
+        w_min = max(prefix_low, K - suffix_high)
+        w_max = min(prefix_high, K - suffix_low)
+        boundaries.append(
+            CumulativeBoundary(
+                index=p,
+                cumulative_diff=prefix_diff,
+                min_wraps=w_min,
+                max_wraps=w_max,
+                min_usage=prefix_diff + w_min * modulus,
+                max_usage=prefix_diff + w_max * modulus,
+            )
+        )
+        if p < n:
+            prefix_low += lows[p]
+            prefix_high += highs[p]
+            prefix_diff += diffs[p]
+
+    # 3) 最早段：首个上界可达目标的边界 i+1 对应段 i；
+    #    最晚段：末个下界仍低于目标的边界 i 对应段 i。
+    #    C_0 = 0 < T <= B = C_n 保证两者都必然存在。
+    earliest = next(
+        i for i in range(n) if boundaries[i + 1].max_usage >= target_usage
+    )
+    latest = next(
+        i for i in range(n - 1, -1, -1) if boundaries[i].min_usage < target_usage
+    )
+
+    return TargetLocateResult(
+        status=STATUS_OK,
+        conflicts=(),
+        total_wraps=K,
+        target_usage=target_usage,
+        narrowed=reconciled.narrowed,
+        boundaries=tuple(boundaries),
+        earliest_segment=earliest,
+        latest_segment=latest,
     )
