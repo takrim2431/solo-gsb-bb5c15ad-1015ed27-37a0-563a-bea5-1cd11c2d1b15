@@ -28,6 +28,7 @@ from app.core import (
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
+    locate_cumulative_target,
     LossMeterSegment,
     reconcile_master_sub_loss,
     reconcile_meter_total,
@@ -41,7 +42,7 @@ from app.core import (
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.10.0",
+    version="1.11.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -79,7 +80,12 @@ app = FastAPI(
         "圈数区间的连续差值求每段漏损（总表用量减各分表用量之和，非负）"
         "的可行范围，再以给定整期漏损总量联立收紧各段范围，仅在唯一时"
         "给出确定漏损，不枚举回绕组合；区分单表无解、单段漏损无法非负、"
-        "总量同余冲突与总量超界。"
+        "总量同余冲突与总量超界；"
+        "另支持账期累计用量目标定位：在账单总量对账可行、整期总圈数"
+        "固定的约束下，给出每个读数边界累计用量与剩余各段圈数区间联立"
+        "后的可行最小值/最大值，定位累计用量首次达到或超过目标用量的"
+        "最早与最晚相邻读数段（索引从 0 开始），仅二者相同时标记段位"
+        "唯一，不推断段内具体时间。"
     ),
 )
 
@@ -153,6 +159,30 @@ class ReconcileRequest(_BaseUsageRequest):
     total_usage: int = Field(
         ge=0, description="账单总用量（非负整数）"
     )
+
+
+class CumulativeTargetRequest(_BaseUsageRequest):
+    """账期累计用量目标定位请求：读数/模数/速率校验与账单对账一致。
+
+    在复核接口字段基础上增加账单总用量与目标用量；目标用量须满足
+    ``1 <= target_usage <= total_usage``。
+    """
+
+    total_usage: int = Field(ge=0, description="账单总用量（非负整数）")
+    target_usage: int = Field(
+        ge=1,
+        description="目标用量（正整数），累计用量首次达到或超过它的相邻读数段即定位目标；"
+        "必须不超过账单总用量 total_usage",
+    )
+
+    @model_validator(mode="after")
+    def _check_target_within_bill(self) -> "CumulativeTargetRequest":
+        if self.target_usage > self.total_usage:
+            raise ValueError(
+                f"目标用量 {self.target_usage} 不能超过账单总用量 "
+                f"{self.total_usage}（须满足 1 <= target_usage <= total_usage）"
+            )
+        return self
 
 
 def _decimal_unit_price(v: Decimal) -> Decimal:
@@ -466,6 +496,104 @@ class ReconcileResponse(BaseModel):
     conflicts: List[
         Union[ReconcileSegmentErrorOut, ReconcileTotalErrorOut]
     ] = Field(description="冲突明细：某段原本无解，或账单总量与模数不相容/超界")
+
+
+# ---------------------------------------------------------------------------
+# 账期累计用量目标定位接口响应模型
+# ---------------------------------------------------------------------------
+
+CUMULATIVE_TARGET_NOTE = (
+    "每个读数边界的 cumulative_min/cumulative_max 均为该边界前缀各段与"
+    "剩余各段圈数区间在总圈数固定下同时联立后的累计用量极值（端点可由"
+    "某个完整可行分配达到）；不同边界的极值不保证由同一份分配同时达到。"
+    "首次穿越段判定要求同一份分配在该段起点前低于目标、在该段终点处达到"
+    "或超过目标，仅定位到相邻读数段，不推断段内具体时间"
+)
+
+
+class CumulativeBoundaryOut(BaseModel):
+    """一个读数边界（含首末）的累计用量可行范围与目标可达标记。"""
+
+    index: int = Field(description="读数边界索引，0 为首读数，最大为末读数（读数数 − 1）")
+    timestamp: datetime = Field(description="该边界读数的秒精度 UTC 时间戳")
+    reading: int = Field(description="该边界的计数器读数")
+    cumulative_min: int = Field(
+        description="与剩余各段圈数区间联立后，该边界累计用量的可行最小值（含，可达到）"
+    )
+    cumulative_max: int = Field(
+        description="与剩余各段圈数区间联立后，该边界累计用量的可行最大值（含，可达到）"
+    )
+    min_below_target: bool = Field(
+        description="是否存在某个可行分配使该边界累计用量严格小于目标用量"
+    )
+    max_reaches_target: bool = Field(
+        description="是否存在某个可行分配使该边界累计用量达到或超过目标用量"
+    )
+
+
+class CumulativeSegmentOut(BaseModel):
+    """一个相邻读数段的总量收紧圈数范围与是否可能首次穿越目标。"""
+
+    index: int = Field(description="相邻读数段索引，从 0 开始")
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    min_wraps: int = Field(description="账单总量约束后仍可行的最小回绕次数")
+    max_wraps: int = Field(description="账单总量约束后仍可行的最大回绕次数")
+    wraps: Optional[int] = Field(
+        default=None, description="圈数唯一时的回绕次数；仍有多解时为 null"
+    )
+    usage: Optional[int] = Field(
+        default=None, description="圈数唯一时该段的确定用量；仍有多解时为 null"
+    )
+    min_usage: Optional[int] = Field(
+        default=None, description="仍有多解时该段用量的下界；圈数唯一时为 null"
+    )
+    max_usage: Optional[int] = Field(
+        default=None, description="仍有多解时该段用量的上界；圈数唯一时为 null"
+    )
+    can_cross_target: bool = Field(
+        description="是否存在某个可行分配，使累计用量在本段首次达到或超过目标"
+        "（段起点前严格低于目标、段终点处达到或超过目标）"
+    )
+
+
+class CumulativeTargetResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    total_usage: int = Field(description="请求给出的账单总用量")
+    target_usage: int = Field(description="请求给出的目标用量")
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；冲突时可能为 null",
+    )
+    boundaries: List[CumulativeBoundaryOut] = Field(
+        description="各读数边界（含首末，按索引升序）的累计用量可行最小值/最大值与目标可达标记；冲突时为空"
+    )
+    segments: List[CumulativeSegmentOut] = Field(
+        description="账单总量约束后的各段圈数/用量范围及 can_cross_target；冲突时为空"
+    )
+    earliest_segment: Optional[int] = Field(
+        default=None,
+        description="累计用量首次达到或超过目标的最早可能相邻读数段索引（从 0 开始）；冲突时为 null",
+    )
+    latest_segment: Optional[int] = Field(
+        default=None,
+        description="累计用量首次达到或超过目标的最晚可能相邻读数段索引（从 0 开始）；冲突时为 null",
+    )
+    segment_unique: bool = Field(
+        description="最早与最晚可能穿越段是否相同（相同才标记段位唯一）"
+    )
+    boundary_note: str = Field(description="前缀极值联立与不推断段内时间的说明")
+    conflicts: List[
+        Union[ReconcileSegmentErrorOut, ReconcileTotalErrorOut]
+    ] = Field(
+        description="冲突明细：某段原本无解（no_solution），或账单总量"
+        "与模数不相容（total_incompatible_modulus）/ 超出可行总量"
+        "（total_out_of_range）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1269,187 @@ def reconcile_usage(req: ReconcileRequest) -> ReconcileResponse:
         total_usage=req.total_usage,
         total_wraps=result.total_wraps,
         segments=segments,
+        conflicts=[],
+    )
+
+
+@app.post("/v1/usage/cumulative-target", response_model=CumulativeTargetResponse)
+def locate_cumulative_usage_target(
+    req: CumulativeTargetRequest,
+) -> CumulativeTargetResponse:
+    """账期累计用量目标定位：固定整期总圈数，定位目标用量的首次穿越段。
+
+    复用现有秒级时间戳、读数范围、模数与速率上限校验（与
+    `/v1/usage/reconcile` 完全一致），先逐段判定非负增量与速率上限夹出
+    的可行回绕整数区间，某段无解即以分段冲突返回，不做总量联立；各段均
+    可行后以账单总用量做整数区间对账（``reconcile_total``），账单与模数
+    不同余（总量同余不相容）或总回绕次数超出各段区间和（总量超界）分别
+    给出可区分原因。
+
+    可行时总回绕次数 K 固定。对每个读数边界，把**前缀各段**与**剩余各
+    段**的圈数区间同时联立（其余段须能以各自区间补足 K），给出该边界累
+    计用量的可行最小值与最大值——不把互不兼容的分段极值直接拼接。对每
+    个相邻读数段判定是否存在**同一份**圈数分配，使累计用量在该段起点前
+    严格低于目标、在该段终点处达到或超过目标（段被固定为 0 用量时穿越
+    不可能落在该段，即使两个相邻边界的边际极值看起来跨越目标）；取全部
+    可行段的最小/最大索引给出最早/最晚首次穿越段，仅二者相同时标记段位
+    唯一。只定位到相邻读数段，**不推断段内具体时间**。
+    """
+    solved = _solve_all(req)
+
+    # 1) 某段原本无解：直接构成冲突，不进行总量推断
+    segment_conflicts: List[ReconcileSegmentErrorOut] = []
+    feasible = []
+    for a, b, elapsed, sol in solved:
+        if sol.status == STATUS_NO_SOLUTION:
+            segment_conflicts.append(
+                ReconcileSegmentErrorOut(
+                    kind="segment",
+                    index=sol.index,
+                    start_timestamp=a.timestamp,
+                    end_timestamp=b.timestamp,
+                    start_reading=a.value,
+                    end_reading=b.value,
+                    elapsed_seconds=elapsed,
+                    reason=STATUS_NO_SOLUTION,
+                    detail=_no_solution_detail(
+                        b.value - a.value, req.modulus, sol, elapsed
+                    ),
+                    min_wraps=sol.min_wraps,
+                    max_wraps=sol.max_wraps,
+                )
+            )
+        else:
+            feasible.append((a, b, elapsed, sol))
+
+    if segment_conflicts:
+        return CumulativeTargetResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            target_usage=req.target_usage,
+            total_wraps=None,
+            boundaries=[],
+            segments=[],
+            earliest_segment=None,
+            latest_segment=None,
+            segment_unique=False,
+            boundary_note=CUMULATIVE_TARGET_NOTE,
+            conflicts=segment_conflicts,
+        )
+
+    # 2) 总量对账（复用 reconcile_total 的同余/超界规则）+ 目标定位
+    readings = [r.value for r in req.readings]
+    diffs = [b.value - a.value for a, b, _, _ in feasible]
+    bounds = [(sol.min_wraps, sol.max_wraps) for *_, sol in feasible]
+    result = locate_cumulative_target(
+        readings=readings,
+        diffs=diffs,
+        wrap_bounds=bounds,
+        total_usage=req.total_usage,
+        modulus=req.modulus,
+        target_usage=req.target_usage,
+    )
+
+    if result.status == STATUS_CONFLICT:
+        end_minus_start = sum(diffs)
+        expected_remainder = end_minus_start % req.modulus
+        total_conflicts = []
+        for reason in result.conflicts:
+            if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+                detail = (
+                    f"账单总量与模数不相容：总量 B 必须满足 "
+                    f"B ≡ {expected_remainder} (mod {req.modulus})"
+                    f"（首尾读数差为 {end_minus_start}），收到 "
+                    f"{req.total_usage}（余数 {req.total_usage % req.modulus}），"
+                    f"总回绕次数不是整数"
+                )
+            else:  # REASON_TOTAL_OUT_OF_RANGE
+                detail = (
+                    f"账单总量超出可行范围：各段回绕次数均为非负整数且满足"
+                    f"速率上限时，总用量只能在 [{result.feasible_min_total}, "
+                    f"{result.feasible_max_total}]（模数 {req.modulus}）之内，"
+                    f"收到 {req.total_usage}"
+                )
+            total_conflicts.append(
+                ReconcileTotalErrorOut(
+                    kind="total",
+                    reason=reason,  # type: ignore[arg-type]
+                    detail=detail,
+                    feasible_min_total=result.feasible_min_total,
+                    feasible_max_total=result.feasible_max_total,
+                    expected_remainder=(
+                        expected_remainder
+                        if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS
+                        else None
+                    ),
+                    total_wraps=result.total_wraps,
+                )
+            )
+        return CumulativeTargetResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            target_usage=req.target_usage,
+            total_wraps=result.total_wraps,
+            boundaries=[],
+            segments=[],
+            earliest_segment=None,
+            latest_segment=None,
+            segment_unique=False,
+            boundary_note=CUMULATIVE_TARGET_NOTE,
+            conflicts=total_conflicts,
+        )
+
+    # 3) 可行：各边界累计用量范围 + 各段圈数范围与首次穿越标记
+    boundaries_out = [
+        CumulativeBoundaryOut(
+            index=b.index,
+            timestamp=req.readings[b.index].timestamp,
+            reading=b.reading_value,
+            cumulative_min=b.cumulative_min,
+            cumulative_max=b.cumulative_max,
+            min_below_target=b.min_below_target,
+            max_reaches_target=b.max_reaches_target,
+        )
+        for b in result.boundaries
+    ]
+
+    segments_out: List[CumulativeSegmentOut] = []
+    for (a, b, elapsed, _), ns, can_cross in zip(
+        feasible, result.narrowed, result.segment_can_cross
+    ):
+        min_usage, max_usage = ns.usage_bounds(req.modulus)
+        segments_out.append(
+            CumulativeSegmentOut(
+                index=ns.index,
+                start_timestamp=a.timestamp,
+                end_timestamp=b.timestamp,
+                start_reading=a.value,
+                end_reading=b.value,
+                elapsed_seconds=elapsed,
+                min_wraps=ns.min_wraps,
+                max_wraps=ns.max_wraps,
+                wraps=ns.wraps,
+                usage=ns.usage(req.modulus),
+                min_usage=None if ns.unique else min_usage,
+                max_usage=None if ns.unique else max_usage,
+                can_cross_target=can_cross,
+            )
+        )
+
+    return CumulativeTargetResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        total_usage=req.total_usage,
+        target_usage=req.target_usage,
+        total_wraps=result.total_wraps,
+        boundaries=boundaries_out,
+        segments=segments_out,
+        earliest_segment=result.earliest_segment,
+        latest_segment=result.latest_segment,
+        segment_unique=result.segment_unique,
+        boundary_note=CUMULATIVE_TARGET_NOTE,
         conflicts=[],
     )
 

@@ -16,6 +16,7 @@ from app.core import (
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
+    locate_cumulative_target,
     reconcile_master_sub_loss,
     reconcile_meter_total,
     reconcile_total,
@@ -60,6 +61,10 @@ def _dual_meter(payload):
 
 def _outage(payload):
     return _post(payload, path="/v1/usage/outage-reconcile")
+
+
+def _cumulative_target(payload):
+    return _post(payload, path="/v1/usage/cumulative-target")
 
 
 # ---------------------------------------------------------------------------
@@ -3674,3 +3679,353 @@ def test_reconcile_master_sub_loss_exact_by_brute_force():
             for i in range(n_seg):
                 assert lows[i] + sum(highs[j] for j in range(n_seg) if j != i) == L
     assert checked > 300
+
+
+# ---------------------------------------------------------------------------
+# 账期累计用量目标定位 /v1/usage/cumulative-target
+# ---------------------------------------------------------------------------
+
+
+def test_cumulative_target_non_unique_segment_range():
+    """两段多解 K=5、目标 2500：穿越段可能为 0 或 1，段位不唯一。"""
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5000,
+            "target_usage": 2500,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+                {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+            ],
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 5
+    assert body["earliest_segment"] == 0
+    assert body["latest_segment"] == 1
+    assert body["segment_unique"] is False
+    # 边界：0 -> 固定 0；1 -> [100, 4100]；2 -> 固定 5000
+    bounds = [
+        (b["cumulative_min"], b["cumulative_max"]) for b in body["boundaries"]
+    ]
+    assert bounds == [(0, 0), (100, 4100), (5000, 5000)]
+    assert [s["can_cross_target"] for s in body["segments"]] == [True, True]
+    # 中间边界两侧标记都为真（不同分配分别达到）
+    mid = body["boundaries"][1]
+    assert mid["min_below_target"] is True
+    assert mid["max_reaches_target"] is True
+    # 收紧后的分段圈数/用量范围与对账接口一致
+    s0, s1 = body["segments"]
+    assert (s0["min_wraps"], s0["max_wraps"]) == (0, 4)
+    assert (s0["min_usage"], s0["max_usage"]) == (100, 4100)
+    assert (s1["min_wraps"], s1["max_wraps"]) == (1, 5)
+    assert (s1["min_usage"], s1["max_usage"]) == (900, 4900)
+
+
+def test_cumulative_target_unique_segment():
+    """同一账单，目标 100：最早最晚都是段 0，段位唯一。"""
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5000,
+            "target_usage": 100,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+                {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["earliest_segment"] == 0
+    assert body["latest_segment"] == 0
+    assert body["segment_unique"] is True
+    assert [s["can_cross_target"] for s in body["segments"]] == [True, False]
+
+
+def test_cumulative_target_equals_bill_total():
+    """目标等于账单总量：首次穿越必在最后一段（末边界恰达到目标）。"""
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5000,
+            "target_usage": 5000,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+                {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["earliest_segment"] == 1
+    assert body["latest_segment"] == 1
+    assert body["segment_unique"] is True
+    assert [s["can_cross_target"] for s in body["segments"]] == [False, True]
+    last = body["boundaries"][-1]
+    assert last["cumulative_min"] == last["cumulative_max"] == 5000
+    assert last["min_below_target"] is False
+    assert last["max_reaches_target"] is True
+
+
+def test_cumulative_target_zero_usage_segment_cannot_cross():
+    """被固定为 0 用量的段不可能穿越目标，即使相邻边界边际极值跨越目标。
+
+    三段平读数、M=1000、K=1：中间段仅 10s（容量 100 < 1000）圈数固定
+    为 0，两侧各 100s（容量 1000）圈数可为 0 或 1。目标 500 只能在段 0
+    或段 2 首次达到，段 1 的 can_cross_target 必须为 False（边际上
+    边界 1 的范围为 [0,1000]，但同一分配下边界 1 与边界 2 相同）。
+    """
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 1000,
+            "target_usage": 500,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:01:40Z", "value": 100},
+                {"timestamp": "2026-09-24T00:01:50Z", "value": 100},
+                {"timestamp": "2026-09-24T00:03:30Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 1
+    assert [s["can_cross_target"] for s in body["segments"]] == [
+        True,
+        False,
+        True,
+    ]
+    assert body["earliest_segment"] == 0
+    assert body["latest_segment"] == 2
+    assert body["segment_unique"] is False
+    # 段 1 圈数唯一为 0、用量唯一为 0
+    mid_seg = body["segments"][1]
+    assert mid_seg["wraps"] == 0 and mid_seg["usage"] == 0
+
+
+def test_cumulative_target_prefix_extremes_joint_with_remainder():
+    """三段各允许 0..1 圈、K=1：前缀极值须与剩余段联立。
+
+    朴素拼接会给出边界 1 最大 1000（前缀取 1）且边界 2 最大 1000
+    （再取 1），但总圈数固定为 1，联立后边界 1、边界 2 的可行范围
+    均恰为 [0, 1000]，且不存在二者同时为 1000 的分配。
+    """
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 100,
+            "total_usage": 1000,
+            "target_usage": 500,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 0},
+                {"timestamp": "2026-09-24T00:00:10Z", "value": 0},
+                {"timestamp": "2026-09-24T00:00:20Z", "value": 0},
+                {"timestamp": "2026-09-24T00:00:30Z", "value": 0},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    ranges = [
+        (b["cumulative_min"], b["cumulative_max"]) for b in body["boundaries"]
+    ]
+    assert ranges == [(0, 0), (0, 1000), (0, 1000), (1000, 1000)]
+    # 每一段都可能成为唯一一圈的承载段，故都可能穿越
+    assert [s["can_cross_target"] for s in body["segments"]] == [
+        True,
+        True,
+        True,
+    ]
+    assert (body["earliest_segment"], body["latest_segment"]) == (0, 2)
+
+
+def test_cumulative_target_conflicts_reuse_reconcile_rules():
+    """单段无解、同余冲突、总量超界复用账单对账规则。"""
+    base_readings = [
+        {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+        {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+        {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+    ]
+    # 总量同余冲突
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 5500,
+            "target_usage": 100,
+            "readings": base_readings,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["boundaries"] == [] and body["segments"] == []
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert body["total_wraps"] is None
+    assert body["earliest_segment"] is None
+
+    # 总量超界（同余成立）
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 10,
+            "total_usage": 21000,
+            "target_usage": 100,
+            "readings": base_readings,
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    conflict = body["conflicts"][0]
+    assert conflict["reason"] == "total_out_of_range"
+    assert body["total_wraps"] == 21
+
+    # 单段无解
+    resp = _cumulative_target(
+        {
+            "modulus": 1000,
+            "max_rate_per_second": 20,
+            "total_usage": 300,
+            "target_usage": 100,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:00:10Z", "value": 300},
+                {"timestamp": "2026-09-24T00:00:11Z", "value": 900},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "segment"
+    assert conflict["reason"] == "no_solution"
+    assert conflict["index"] == 1
+
+
+def test_cumulative_target_validation():
+    """目标用量越界（<1 或 >账单总量）及读数校验失败均 422。"""
+    base = {
+        "modulus": 1000,
+        "max_rate_per_second": 10,
+        "total_usage": 5000,
+        "readings": [
+            {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+            {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+            {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+        ],
+    }
+    assert _cumulative_target({**base, "target_usage": 0}).status_code == 422
+    assert _cumulative_target({**base, "target_usage": -5}).status_code == 422
+    assert _cumulative_target({**base, "target_usage": 5001}).status_code == 422
+    bad = {
+        **base,
+        "target_usage": 100,
+        "readings": [
+            {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+            {"timestamp": "2026-09-24T00:00:00Z", "value": 200},
+            {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+        ],
+    }
+    assert _cumulative_target(bad).status_code == 422
+
+
+# locate_cumulative_target 精确性：与全枚举暴力结果比对（固定随机种子）
+def test_locate_cumulative_target_exact_by_brute_force():
+    """随机小参数下，边界范围、穿越段集合及最早/最晚段与全枚举一致。"""
+    rng = random.Random(20260926)
+    checked = 0
+    for _ in range(400):
+        n_seg = rng.choice([1, 2, 3, 4])
+        modulus = rng.choice([2, 3, 5, 10])
+        values = [rng.randrange(modulus) for _ in range(n_seg + 1)]
+        seconds = [rng.choice([1, 2, 3, 5, 10]) for _ in range(n_seg)]
+        rate = Fraction(rng.choice([0, 1, 2, 3, 5, 10]), rng.choice([1, 1, 2, 3]))
+        diffs = [b - a for a, b in zip(values, values[1:])]
+        bounds = []
+        feasible_seg = True
+        for i in range(n_seg):
+            sol = solve_segment(
+                i, values[i], values[i + 1], seconds[i], modulus, rate
+            )
+            if sol.max_wraps < sol.min_wraps:
+                feasible_seg = False
+                break
+            bounds.append((sol.min_wraps, sol.max_wraps))
+        if not feasible_seg:
+            continue
+        end_minus_start = values[-1] - values[0]
+        bills = sorted(
+            {
+                end_minus_start + modulus * K
+                for K in range(
+                    sum(lo for lo, _ in bounds),
+                    sum(hi for _, hi in bounds) + 1,
+                )
+            }
+        )
+        bills = [b for b in bills if b >= 1]
+        if not bills:
+            continue
+        bill = rng.choice(bills)
+        target = rng.randint(1, bill)
+
+        result = locate_cumulative_target(
+            values, diffs, bounds, bill, modulus, target
+        )
+        assert result.status == "ok"
+
+        # 全枚举满足 Σk = K 的圈数组合
+        K = (bill - end_minus_start) // modulus
+        combos = [
+            ks
+            for ks in itertools.product(
+                *[range(lo, hi + 1) for lo, hi in bounds]
+            )
+            if sum(ks) == K
+        ]
+        assert combos
+
+        for j in range(n_seg + 1):
+            prefix_values = [
+                (values[j] - values[0])
+                + modulus * sum(ks[:j])
+                for ks in combos
+            ]
+            b = result.boundaries[j]
+            assert b.cumulative_min == min(prefix_values)
+            assert b.cumulative_max == max(prefix_values)
+            assert b.min_below_target == (min(prefix_values) < target)
+            assert b.max_reaches_target == (max(prefix_values) >= target)
+
+        expected_cross = [False] * n_seg
+        for ks in combos:
+            prefix = [
+                (values[j] - values[0]) + modulus * sum(ks[:j])
+                for j in range(n_seg + 1)
+            ]
+            for i in range(n_seg):
+                if prefix[i] < target <= prefix[i + 1]:
+                    expected_cross[i] = True
+        assert list(result.segment_can_cross) == expected_cross
+        expected_indices = [i for i, ok in enumerate(expected_cross) if ok]
+        assert expected_indices  # Q <= B 时至少有一段穿越
+        assert result.earliest_segment == expected_indices[0]
+        assert result.latest_segment == expected_indices[-1]
+        assert result.segment_unique == (
+            expected_indices[0] == expected_indices[-1]
+        )
+        checked += 1
+    assert checked > 200

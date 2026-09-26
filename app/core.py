@@ -146,6 +146,36 @@
     （total_out_of_range）。收紧后 lo_i == hi_i 的段漏损唯一、给出
     确定值，其余段只给漏损上下界（端点均可达到，交叉端点相等），不
     枚举任何回绕组合。
+
+账期累计用量目标定位（locate_cumulative_target）：
+    复用 solve_segment 的单段可行圈数判定与 reconcile_total 的账单对账
+    规则（单段无解 no_solution、账单同余冲突 total_incompatible_modulus、
+    总量超界 total_out_of_range）。对账可行后总圈数 K = Σ k_i 固定，
+    各段 k_i ∈ [lo_i, hi_i]（联立前的原始单段区间）且 Σ k_i = K。读数
+    边界 j（j = 0..n，索引从 0 开始）的累计用量为前缀和
+        P_j = Σ_{i<j} (diff_i + k_i*M) = (r_j - r_first) + M*Σ_{i<j} k_i
+    前缀圈数和的极值必须把「前缀各段」与「剩余各段」同时联立（其余段
+    须能以各自圈数区间补足 K），不能把互不兼容的分段极值直接拼接：
+        s_j^min = max(Σ_{i<j} lo_i, K - Σ_{i>=j} hi_i)
+        s_j^max = min(Σ_{i<j} hi_i, K - Σ_{i>=j} lo_i)
+    二者均为整数区间盒与总量超平面之交的投影，端点均可达到。
+    对目标用量 Q（1 <= Q <= 账单总量 B），首次达到或超过 Q 的相邻读数
+    段 i（即 P_i < Q <= P_{i+1}）是否可能，须同一份圈数分配同时满足
+    两侧，单独比较两个边界的边际极值仍不充分（如某段被固定为 0 用量
+    时，穿越只能发生在前一段或后一段）。记前缀 A = {0..i-1}、后缀
+    C = {i+1..n-1}：
+        L_i = floor((Q - 1 - (r_i - r_first)) / M)   （P_i < Q 的前缀圈数上限）
+        U_i = ceil((Q - (r_{i+1} - r_first)) / M)    （P_{i+1} >= Q 的前缀圈数下限）
+    前缀 A 圈数和在 K 与 i 段、后缀 C 联立后的可行范围为 [A_lo, A_hi]：
+        A_lo = max(Σ_A lo, K - hi_i - Σ_C hi)
+        A_hi = min(Σ_A hi, K - lo_i - Σ_C lo)
+    在 s_A <= L_i 下取最大可行 s_A* = min(L_i, A_hi)（A_lo <= L_i 时
+    非空），该位置下 i 段及其前缀能达到的最大前缀圈数和为
+        b_max = s_A* + min(hi_i, K - s_A* - Σ_C lo)
+    段 i 可能成为首次穿越段当且仅当 A_lo <= L_i 且 b_max >= U_i。
+    取全部可行段的最小/最大索引即最早/最晚穿越段；二者相同才标记段位
+    唯一。只定位到相邻读数段，不推断段内具体时间。全程整数区间运算，
+    不枚举圈数组合。
 """
 
 from __future__ import annotations
@@ -1783,4 +1813,208 @@ def reconcile_master_sub_loss(
         total_wraps=total_wraps,
         feasible_min_total=feasible_min_total,
         feasible_max_total=feasible_max_total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 账期累计用量目标定位（cumulative-target）：固定总圈数下定位目标用量首次穿越段
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CumulativeBoundary:
+    """一个读数边界（含首末）的累计用量可行范围与目标可达标记。"""
+
+    index: int  # 读数边界索引，0 .. n（0 为首读数，n 为末读数）
+    reading_value: int  # 该边界读数 r_j（累计用量的非回绕基准）
+    # 与剩余各段圈数区间联立后的累计用量最小/最大值（端点均可达到）
+    cumulative_min: int
+    cumulative_max: int
+    min_below_target: bool  # 是否存在可行分配使该边界累计用量 < target
+    max_reaches_target: bool  # 是否存在可行分配使该边界累计用量 >= target
+
+
+@dataclass(frozen=True)
+class CumulativeTargetResult:
+    """账期累计用量目标定位结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # 与 reconcile_total 相同的冲突原因
+    total_wraps: Optional[int]  # 账单隐含的总回绕次数 K；不相容时为 None
+    feasible_min_total: int
+    feasible_max_total: int
+    # 账单总量收紧后的各段圈数区间（与 ReconcileResult.narrowed 相同）；冲突时为空
+    narrowed: Tuple["NarrowedSegment", ...]
+    boundaries: Tuple[CumulativeBoundary, ...]  # n+1 个读数边界，按索引升序
+    # 各相邻读数段（0..n-1）是否可能成为首次达到或超过目标的段
+    segment_can_cross: Tuple[bool, ...]
+    earliest_segment: Optional[int]  # 最早可能的首次穿越段索引；冲突时为 None
+    latest_segment: Optional[int]  # 最晚可能的首次穿越段索引；冲突时为 None
+    segment_unique: bool  # 最早与最晚段相同（段位唯一）
+
+
+def locate_cumulative_target(
+    readings: Sequence[int],
+    diffs: Sequence[int],
+    wrap_bounds: Sequence[Tuple[int, int]],
+    total_usage: int,
+    modulus: int,
+    target_usage: int,
+) -> CumulativeTargetResult:
+    """固定账单总圈数下定位累计用量首次达到或超过目标的相邻读数段。
+
+    调用方需先逐段通过 :func:`solve_segment` 判定（``wrap_bounds`` 为各段
+    可行圈数区间 ``(k_min, k_max)``）。本函数直接复用
+    :func:`reconcile_total` 的账单对账：账单与模数不同余
+    （``total_incompatible_modulus``）或总圈数超界
+    （``total_out_of_range``）时原样返回冲突，不做定位。
+
+    对账可行后 ``K = Σ k_i`` 固定。读数边界 ``j`` 的累计用量为
+
+        P_j = (r_j - r_first) + M * Σ_{i<j} k_i
+
+    前缀圈数和 ``s_j = Σ_{i<j} k_i`` 必须与**剩余各段**的圈数区间同时
+    联立（其余段须能补足 ``K - s_j``），其可行范围为
+
+        s_j^min = max(Σ_{i<j} lo_i, K - Σ_{i>=j} hi_i)
+        s_j^max = min(Σ_{i<j} hi_i, K - Σ_{i>=j} lo_i)
+
+    即整数区间盒与总量超平面 ``Σ k_i = K`` 之交在前缀上的投影（端点均可
+    达到）；不可把各段独立极值直接相加当作前缀极值——那会拼出无法同时
+    满足剩余段区间的圈数组合。
+
+    目标 ``Q`` 首次在段 ``i`` 内被达到或超过（``P_i < Q <= P_{i+1}``）
+    要求**同一份**分配同时满足两侧。记前缀 A = {0..i-1}、后缀
+    C = {i+1..n-1}，则
+
+        L_i = floor((Q-1 - (r_i - r_first)) / M)      （P_i < Q）
+        U_i = ceil((Q - (r_{i+1} - r_first)) / M)     （P_{i+1} >= Q）
+
+    前缀 A 圈数和在 i 段与后缀 C 联立后的可行范围为
+
+        A_lo = max(Σ_A lo, K - hi_i - Σ_C hi)
+        A_hi = min(Σ_A hi, K - lo_i - Σ_C lo)
+
+    在 ``s_A <= L_i``（边界 i 尚未达到目标）的前提下，最大可行前缀圈数
+    和为 ``s_A* = min(L_i, A_hi)``；该位置下「前缀 + i 段」能达到的最大
+    圈数和为
+
+        b_max = s_A* + min(hi_i, K - s_A* - Σ_C lo)
+
+    段 i 可能成为首次穿越段当且仅当 ``A_lo <= L_i``（存在停留在目标之
+    下的前缀）且 ``b_max >= U_i``（同一份分配可在 i 段达到目标）。可行
+    段集合的最小/最大索引即最早/最晚首次穿越段；二者相同才标记段位
+    唯一。只定位到相邻读数段，**不推断段内具体时间**。
+
+    :param readings: 各读数 r_0 .. r_n（共 n+1 个），用于累计基准
+    :param target_usage: 目标用量，调用方保证 ``1 <= target_usage <= total_usage``
+    """
+    n = len(diffs)
+    if len(readings) != n + 1:
+        raise ValueError("readings 数量必须比 diffs 多 1")
+    if len(wrap_bounds) != n:
+        raise ValueError("wrap_bounds 数量必须与 diffs 一致")
+    if not (1 <= target_usage <= total_usage):
+        raise ValueError("目标用量必须满足 1 <= target_usage <= total_usage")
+
+    reconciliation = reconcile_total(diffs, wrap_bounds, total_usage, modulus)
+    if reconciliation.status == STATUS_CONFLICT:
+        return CumulativeTargetResult(
+            status=STATUS_CONFLICT,
+            conflicts=reconciliation.conflicts,
+            total_wraps=reconciliation.total_wraps,
+            feasible_min_total=reconciliation.feasible_min_total,
+            feasible_max_total=reconciliation.feasible_max_total,
+            narrowed=(),
+            boundaries=(),
+            segment_can_cross=(),
+            earliest_segment=None,
+            latest_segment=None,
+            segment_unique=False,
+        )
+
+    K = reconciliation.total_wraps
+    assert K is not None
+    lows = [lo for lo, _ in wrap_bounds]
+    highs = [hi for _, hi in wrap_bounds]
+    sum_low_all, sum_high_all = sum(lows), sum(highs)
+
+    # 前缀累计和：pre_lo[j] = Σ_{i<j} lo_i，pre_hi[j] = Σ_{i<j} hi_i
+    pre_lo = [0] * (n + 1)
+    pre_hi = [0] * (n + 1)
+    for j in range(n):
+        pre_lo[j + 1] = pre_lo[j] + lows[j]
+        pre_hi[j + 1] = pre_hi[j] + highs[j]
+
+    first_reading = readings[0]
+
+    # 1) 各读数边界累计用量的可行最小值/最大值（前缀与剩余段联立）
+    boundaries: list = []
+    can_cross: list = []
+    for j in range(n + 1):
+        # 剩余段 {j..n-1} 的区间和
+        rest_lo = sum_low_all - pre_lo[j]
+        rest_hi = sum_high_all - pre_hi[j]
+        s_min = max(pre_lo[j], K - rest_hi)
+        s_max = min(pre_hi[j], K - rest_lo)
+        reading_delta = readings[j] - first_reading
+        cum_min = reading_delta + modulus * s_min
+        cum_max = reading_delta + modulus * s_max
+        boundaries.append(
+            CumulativeBoundary(
+                index=j,
+                reading_value=readings[j],
+                cumulative_min=cum_min,
+                cumulative_max=cum_max,
+                min_below_target=cum_min < target_usage,
+                max_reaches_target=cum_max >= target_usage,
+            )
+        )
+
+    # 2) 各相邻读数段是否可能成为首次穿越段（两侧条件须同一份分配满足）
+    for i in range(n):
+        # 前缀 A = {0..i-1} 的独立区间和
+        a_lo_raw, a_hi_raw = pre_lo[i], pre_hi[i]
+        # 后缀 C = {i+1..n-1} 的区间和
+        c_lo = sum_low_all - pre_lo[i + 1]
+        c_hi = sum_high_all - pre_hi[i + 1]
+        lo_i, hi_i = lows[i], highs[i]
+
+        # 前缀 A 圈数和与 i 段、后缀 C（须补足 K）联立后的可行范围
+        a_lo = max(a_lo_raw, K - hi_i - c_hi)
+        a_hi = min(a_hi_raw, K - lo_i - c_lo)
+
+        # P_i < Q <=> (r_i - r_first) + M*s_A <= Q-1 <=> s_A <= L_i
+        prefix_limit = (target_usage - 1 - (readings[i] - first_reading)) // modulus
+        if a_lo > prefix_limit:
+            can_cross.append(False)
+            continue
+        # 停留在目标之下的前提下取最大可行前缀圈数和
+        s_star = min(prefix_limit, a_hi)
+        # 同一位置下 i 段可取的最大圈数（后缀 C 至少用 c_lo）
+        max_i_wraps = min(hi_i, K - s_star - c_lo)
+        b_max = s_star + max_i_wraps
+
+        # P_{i+1} >= Q <=> (r_{i+1} - r_first) + M*(s_A + k_i) >= Q
+        reach_need = _ceil_div(
+            target_usage - (readings[i + 1] - first_reading), modulus
+        )
+        can_cross.append(b_max >= reach_need)
+
+    crossing_segments = [i for i, ok in enumerate(can_cross) if ok]
+    earliest = crossing_segments[0] if crossing_segments else None
+    latest = crossing_segments[-1] if crossing_segments else None
+
+    return CumulativeTargetResult(
+        status=STATUS_OK,
+        conflicts=(),
+        total_wraps=K,
+        feasible_min_total=reconciliation.feasible_min_total,
+        feasible_max_total=reconciliation.feasible_max_total,
+        narrowed=reconciliation.narrowed,
+        boundaries=tuple(boundaries),
+        segment_can_cross=tuple(can_cross),
+        earliest_segment=earliest,
+        latest_segment=latest,
+        segment_unique=earliest is not None and earliest == latest,
     )

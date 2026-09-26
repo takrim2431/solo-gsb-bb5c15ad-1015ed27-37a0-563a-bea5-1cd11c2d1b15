@@ -22,6 +22,8 @@
 
 另提供**总分表漏损复核**接口：输入**同一模数**的一块总表与**至少一块分表**（各表可有各自每秒速率上限），各表共用同一组严格递增的秒精度时间点并给出对应读数，以及给定的**整期漏损总量**。逐表复用现有读数与速率校验，求每段非负用量的可行回绕圈数区间；每段漏损定义为**总表用量减去各分表用量之和，且不得为负**。利用同模数下总表/分表圈数区间的**连续差值区间**求每段可行漏损范围，再由整期漏损总量联立收紧各段范围（整数区间运算，**不枚举回绕组合**）；仅在唯一时给出确定漏损，其余段只给非负漏损上下界。**单表无解、单段漏损无法非负、总量同余冲突与总量超界**分别给出可区分的冲突原因。
 
+另提供**账期累计用量目标定位**接口：输入模数、严格递增的秒精度读数序列、每秒速率上限、账单总用量与**目标用量**（`1 <= 目标 <= 账单总量`），复用读数校验与单段可行圈数判定，先按账单对账规则处理**单段无解、同余冲突与总量超界**。可行时整期总圈数固定，对每个读数边界给出累计用量与**剩余各段圈数区间同时联立**后的可行最小值/最大值（不把互不兼容的分段极值拼接），并定位累计用量**首次达到或超过目标**的**最早与最晚相邻读数段**（索引从 0 开始）；仅二者相同时标记段位唯一，**不推断段内具体时间**。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -40,6 +42,7 @@ docker compose up --build
 - 最小统一速率上限：`POST http://localhost:8000/v1/usage/minimum-rate`
 - 双表同段交叉核验：`POST http://localhost:8000/v1/usage/dual-meter/compare`
 - 总分表漏损复核：`POST http://localhost:8000/v1/usage/master-sub/loss-reconcile`
+- 账期累计用量目标定位：`POST http://localhost:8000/v1/usage/cumulative-target`
 - 分时单价账单金额区间：`POST http://localhost:8000/v1/billing/charge-range`
 - 异常采样清理：`POST http://localhost:8000/v1/usage/clean-readings`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
@@ -1441,6 +1444,92 @@ pytest
 
 冲突优先级：先逐表判单表无解（列出全部无解段），再逐段判漏损非负，最后才做整期同余与超界校验。请求校验错误（各表读数条数不一致、同位置时刻不同、读数越界、表内时间不递增、缺时区、含亚秒、分表数为 0、负速率、`total_loss` 为负或非整数、模数 < 1 等）返回 `422`。
 
+### `POST /v1/usage/cumulative-target`
+
+账期累计用量目标定位。请求体在账单对账接口字段基础上增加 `target_usage`（目标用量，须满足 `1 <= target_usage <= total_usage`）；读数、时间戳、模数、速率与 `total_usage` 的校验与 `/v1/usage/reconcile` 完全一致（复用同一校验）。
+
+接口先逐段求满足非负增量与速率上限的回绕整数区间（复用单段判定），某段无解即以分段冲突返回；各段均可行后以账单总用量做整数区间对账（与 `/v1/usage/reconcile` 同一 `reconcile_total` 逻辑），**单段无解、账单总量同余不相容、总量超界**三类冲突原因可区分。可行时整期总圈数 `K` 固定：对每个读数边界（含首末，索引从 0 开始）给出累计用量的可行最小值/最大值——前缀各段与**剩余各段**的圈数区间须同时联立（其余段须能补足 `K`），**不把互不兼容的分段极值拼接**；再定位累计用量**首次达到或超过目标**的最早与最晚相邻读数段，仅二者相同时标记段位唯一，**不推断段内具体时间**。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 10,
+  "total_usage": 5000,
+  "target_usage": 2500,
+  "readings": [
+    { "timestamp": "2026-09-24T00:00:00Z", "value": 100 },
+    { "timestamp": "2026-09-24T00:16:40Z", "value": 200 },
+    { "timestamp": "2026-09-24T00:33:20Z", "value": 100 }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `target_usage` | 整数 | `>= 1` 且 `<= total_usage`，目标用量（累计用量首次达到或超过它的相邻读数段即定位目标） |
+| 其余字段 | — | 与 `/v1/usage/reconcile` 相同（`modulus` / `max_rate_per_second` / `total_usage` / `readings`） |
+
+**响应（可行但段位不唯一，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 5000,
+  "target_usage": 2500,
+  "total_wraps": 5,
+  "boundaries": [
+    { "index": 0, "timestamp": "2026-09-24T00:00:00Z", "reading": 100,
+      "cumulative_min": 0, "cumulative_max": 0,
+      "min_below_target": true, "max_reaches_target": false },
+    { "index": 1, "timestamp": "2026-09-24T00:16:40Z", "reading": 200,
+      "cumulative_min": 100, "cumulative_max": 4100,
+      "min_below_target": true, "max_reaches_target": true },
+    { "index": 2, "timestamp": "2026-09-24T00:33:20Z", "reading": 100,
+      "cumulative_min": 5000, "cumulative_max": 5000,
+      "min_below_target": false, "max_reaches_target": true }
+  ],
+  "segments": [
+    { "index": 0, "start_timestamp": "2026-09-24T00:00:00Z", "end_timestamp": "2026-09-24T00:16:40Z",
+      "start_reading": 100, "end_reading": 200, "elapsed_seconds": 1000,
+      "min_wraps": 0, "max_wraps": 4, "wraps": null, "usage": null,
+      "min_usage": 100, "max_usage": 4100, "can_cross_target": true },
+    { "index": 1, "start_timestamp": "2026-09-24T00:16:40Z", "end_timestamp": "2026-09-24T00:33:20Z",
+      "start_reading": 200, "end_reading": 100, "elapsed_seconds": 1000,
+      "min_wraps": 1, "max_wraps": 5, "wraps": null, "usage": null,
+      "min_usage": 900, "max_usage": 4900, "can_cross_target": true }
+  ],
+  "earliest_segment": 0,
+  "latest_segment": 1,
+  "segment_unique": false,
+  "boundary_note": "……前缀极值联立与不推断段内时间的说明……",
+  "conflicts": []
+}
+```
+
+上例账单 5000 隐含总圈数 `K = 5`，两段圈数收紧为 `[0,4]`、`[1,5]`。边界 1 的累计用量范围为 `[100, 4100]`：可行组合 `(k0, k1) = (0,5)` 时边界 1 累计 `100 < 2500`（穿越发生在段 1），`(4,1)` 时累计 `4100 >= 2500`（穿越发生在段 0），故最早段为 0、最晚段为 1，`segment_unique = false`。
+
+- `boundaries`：`n + 1` 个读数边界（`n` 为段数），按索引升序。`cumulative_min` / `cumulative_max` 为该边界前缀各段与剩余各段圈数区间**同时联立**后的累计用量极值（端点均可由某个完整可行分配达到）；`min_below_target` / `max_reaches_target` 分别表示是否存在可行分配使该边界累计用量严格低于 / 达到或超过目标。首边界恒为 `[0, 0]`，末边界恒为 `[total_usage, total_usage]`。
+- `segments`：账单总量约束后的各段圈数/用量范围（字段同 `/v1/usage/reconcile`），另加 `can_cross_target`——是否存在**同一份**圈数分配使累计用量在本段首次达到或超过目标（段起点前严格低于目标、段终点处达到或超过目标）。
+- `earliest_segment` / `latest_segment`：首次穿越目标的最早/最晚可能相邻读数段索引（从 0 开始）；`segment_unique` 仅当二者相同时为 `true`。
+- `boundary_note`：说明前缀极值的联立性质与「只定位到相邻读数段、不推断段内具体时间」。
+
+**段位唯一（`segment_unique = true`）**：同例目标改为 `100` 时，段 0 最小用量已为 `100 >= 100`，最早最晚段均为 0；目标改为 `5000`（等于账单总量）时，首次穿越必在最后一段，最早最晚段均为 1。
+
+**为什么穿越判定不能只看相邻边界的边际极值**：三段平读数（`100 → 100 → 100 → 100`）、中间段仅 10s（容量 100 < 1000，圈数固定为 0）、两侧各 100s（圈数可为 0 或 1）、账单 1000（`K = 1`）时，边界 1 的累计范围为 `[0, 1000]`——看似目标 500 可能在段 1 穿越，但段 1 用量恒为 0，同一分配下边界 1 与边界 2 的累计用量必然相同，穿越只能发生在段 0 或段 2（`can_cross_target = [true, false, true]`）。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+冲突结构与 `/v1/usage/reconcile` 完全一致（`conflicts` 复用同一模型），三类原因可区分：
+
+- `kind = "segment"`，`reason = "no_solution"`：某段在非负增量/速率上限下原本无解；存在分段冲突时不做总量与定位推断，`boundaries` / `segments` 为空、`earliest_segment` / `latest_segment` 为 `null`、`total_wraps` 为 `null`。
+- `kind = "total"`，`reason = "total_incompatible_modulus"`：账单总量与首尾读数差模 `modulus` 不同余；`expected_remainder` 给出应有余数，`total_wraps` 为 `null`。
+- `kind = "total"`，`reason = "total_out_of_range"`：同余成立但总回绕次数超出 `[Σk_min, Σk_max]`；`feasible_min_total` / `feasible_max_total` 给出可行账单总量区间，`total_wraps` 给出账单隐含的 `K`。
+
+请求校验错误（`target_usage < 1`、`target_usage > total_usage`，以及读数越界、时间不递增、缺时区、含亚秒、负速率、账单为负或非整数等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -1723,12 +1812,51 @@ hi_i' = min(hi_i, W − Σ_{j≠i} lo_j)
 
 `lo_i' == hi_i'` 的段漏损唯一、给出确定值，其余段只给非负漏损上下界。由于各段 `w_i` 相互独立，任何满足 `w_i ∈ [lo_i', hi_i']`、`Σw_i = W` 的整数组合都可由各表圈数独立取值实现（总表取 `k_0`、分表取 `k_t` 使差值为指定 `w_i` 即可），因此段漏损端点均确实可达，且交叉端点相等：段 `i` 漏损下界与其余段漏损上界之和恰为 `L`。全程仅整数区间运算与一次整除，**不枚举任何回绕组合**，计算量只取决于表数与段数，与圈数区间大小无关。
 
+### 账期累计用量目标定位
+
+复用逐段可行圈数判定与「账单总量对账」的冲突规则（单段无解、账单同余冲突、总量超界）。对账可行后总圈数 `K = Σ k_i` 固定，各段 `k_i ∈ [lo_i, hi_i]`（联立前的原始单段区间）且 `Σ k_i = K`。读数边界 `j`（`j = 0..n`，索引从 0 开始）的累计用量为前缀和
+
+```
+P_j = Σ_{i<j} (diff_i + k_i·M) = (r_j − r_first) + M·Σ_{i<j} k_i
+```
+
+**前缀极值须与剩余各段联立**：前缀圈数和 `s_j = Σ_{i<j} k_i` 的可行范围不是各段独立极值之和——其余段必须能以各自圈数区间补足 `K − s_j`，故
+
+```
+s_j^min = max(Σ_{i<j} lo_i, K − Σ_{i>=j} hi_i)
+s_j^max = min(Σ_{i<j} hi_i, K − Σ_{i>=j} lo_i)
+```
+
+这是整数区间盒与总量超平面 `Σ k_i = K` 之交在前缀上的投影，端点均可达到；直接拼接各段极值会得出无法同时满足剩余段区间的组合。
+
+**首次穿越段判定须同一份分配同时满足两侧**。目标 `Q`（`1 <= Q <= B`）首次在段 `i` 内被达到或超过即 `P_i < Q <= P_{i+1}`。记前缀 `A = {0..i-1}`、后缀 `C = {i+1..n-1}`：
+
+```
+L_i = floor((Q − 1 − (r_i − r_first)) / M)     （P_i < Q 的前缀圈数上限）
+U_i = ceil((Q − (r_{i+1} − r_first)) / M)      （P_{i+1} >= Q 的前缀圈数下限）
+```
+
+前缀 `A` 圈数和在 `i` 段与后缀 `C` 联立后的可行范围为
+
+```
+A_lo = max(Σ_A lo, K − hi_i − Σ_C hi)
+A_hi = min(Σ_A hi, K − lo_i − Σ_C lo)
+```
+
+在 `s_A <= L_i`（边界 `i` 尚未达到目标）的前提下取最大可行前缀圈数和 `s_A* = min(L_i, A_hi)`（`A_lo <= L_i` 时非空），该位置下「前缀 + `i` 段」能达到的最大圈数和为
+
+```
+b_max = s_A* + min(hi_i, K − s_A* − Σ_C lo)
+```
+
+段 `i` 可能成为首次穿越段当且仅当 `A_lo <= L_i`（存在停留在目标之下的前缀）且 `b_max >= U_i`（同一份分配可在 `i` 段达到目标）。两个条件缺一不可：例如某段被固定为 0 用量（`hi_i = lo_i = 0`）时，即使相邻两个边界的边际极值都跨越目标，穿越也不可能落在该段。可行段集合的最小/最大索引即最早/最晚首次穿越段（`Q <= B` 保证至少一段可行）；二者相同才标记段位唯一。只定位到相邻读数段，**不推断段内具体时间**。全程整数区间运算，**不枚举圈数组合**。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛、双表同余联立、分时单价金额贪心极值、异常采样清理（DAG 最长路径 + 保留索引字典序选定）与总分表漏损复核（同模数圈数区间连续差值 + 整期总量整数收紧）（Fraction/整数精确计算）
+  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛、双表同余联立、分时单价金额贪心极值、异常采样清理（DAG 最长路径 + 保留索引字典序选定）、总分表漏损复核（同模数圈数区间连续差值 + 整期总量整数收紧）与账期累计用量目标定位（前缀与剩余段圈数区间联立的边界极值 + 首次穿越段联立判定）（Fraction/整数精确计算）
 tests/
   test_api.py
 Dockerfile
